@@ -66,13 +66,21 @@ def log_event(**fields):
 
 
 # ---------------------------------------------------------------- tools
-def run_python(code: str) -> str:
-    """Execute Python code, return captured stdout (or the error)."""
+def run_python(code: str, env: dict | None = None) -> str:
+    """Execute Python code, return captured stdout (or the error).
+
+    `env` is the exec namespace. Pass the SAME dict back in on subsequent
+    calls (e.g. one per question in solve()) so imports, variables, and
+    functions defined in one run_python call persist into the next —
+    otherwise every call starts from scratch and the model has to
+    re-import/re-fetch everything each step, wasting steps and time.
+    """
     out = io.StringIO()
     result: dict = {}
+    if env is None:
+        env = {"__name__": "__main__"}
 
     def target():
-        env = {"__name__": "__main__"}
         try:
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
                 exec(code, env)
@@ -181,8 +189,11 @@ TOOLS = [
                 "construct a direct URL to a known dataset root (see system "
                 "prompt for known domains: data.gov.in, MOSPI, PIB, RBI DBIE, "
                 "NFHS) and fetch it with requests, or download/parse CSV/XLSX/"
-                "HTML tables the question points at directly. Always print() "
-                "what you need to see — nothing else is returned."
+                "HTML tables the question points at directly. Variables, "
+                "imports, and functions PERSIST across calls within this "
+                "conversation — you do not need to re-import or re-fetch "
+                "something you already loaded in an earlier call. Always "
+                "print() what you need to see — nothing else is returned."
             ),
             "parameters": {
                 "type": "object",
@@ -281,6 +292,7 @@ def solve(chat_id: int, question: str) -> str:
 
     log_event(event="question", chat_id=chat_id, text=question)
 
+    py_env: dict = {"__name__": "__main__"}  # persists across run_python calls for this question
     final_text = None
     deadline = time.time() + ANSWER_BUDGET
     for step in range(MAX_AGENT_STEPS):
@@ -320,7 +332,7 @@ def solve(chat_id: int, question: str) -> str:
                     except json.JSONDecodeError:
                         code = tc["function"]["arguments"]
                     log_event(event="tool_call", chat_id=chat_id, step=step, tool="run_python", code=code[:4000])
-                    output = run_python(code)
+                    output = run_python(code, env=py_env)
                     log_event(event="tool_result", chat_id=chat_id, step=step, tool="run_python", output=output[:4000])
                 else:
                     output = f"ERROR: unknown tool '{fn_name}'"
