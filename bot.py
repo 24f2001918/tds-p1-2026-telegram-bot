@@ -8,9 +8,17 @@ Architecture:
   - FastAPI app serves /health and /run.jsonl (the public agent log, app-served).
   - A background thread long-polls Telegram getUpdates.
   - Each incoming message runs an agentic loop (OpenAI-compatible chat API,
-    via aipipe, with a run_python tool) until the model produces the final
-    JSON answer.
+    via aipipe, with run_python + wikipedia_search tools) until the model
+    produces the final JSON answer.
   - A keep-warm thread pings our own public URL so a free host doesn't idle out.
+
+Design note: no web_search (DuckDuckGo scraping) tool. That path was fragile
+(bot detection) and the paid OpenRouter :online alternative needs a balance
+we don't have. Instead the agent fetches data directly via run_python +
+requests/pandas/bs4 (given a short list of known dataset root domains in the
+system prompt), uses wikipedia_search for well-known facts/figures, and
+falls back honestly to trained knowledge only after genuine fetch attempts
+fail — never silently guessing a URL.
 """
 
 import io
@@ -92,47 +100,6 @@ _SEARCH_HEADERS = {
 }
 
 
-def _parse_ddg_html(html: str, selector_prefix=""):
-    from bs4 import BeautifulSoup
-
-    soup = BeautifulSoup(html, "lxml")
-    results = []
-    for res in soup.select(f"{selector_prefix}.result, {selector_prefix}tr")[:10]:
-        title_el = res.select_one("a.result__a, .result__title a, a")
-        snippet_el = res.select_one(".result__snippet")
-        if not title_el:
-            continue
-        title = title_el.get_text(strip=True)
-        href = title_el.get("href", "")
-        if not title or not href or not href.startswith("http"):
-            continue
-        snippet = snippet_el.get_text(strip=True) if snippet_el else ""
-        results.append(f"- {title}\n  URL: {href}\n  {snippet}")
-    return results
-
-
-def web_search(query: str) -> str:
-    """Search the web (no API key needed) and return top result titles +
-    URLs + snippets as text. Tries DuckDuckGo's HTML endpoint, then its
-    lite endpoint as a fallback (some hosts get rate-limited on one)."""
-    attempts = [
-        ("https://html.duckduckgo.com/html/", {"q": query}),
-        ("https://lite.duckduckgo.com/lite/", {"q": query}),
-    ]
-    errors = []
-    for url, params in attempts:
-        try:
-            r = requests.get(url, params=params, headers=_SEARCH_HEADERS, timeout=20)
-            r.raise_for_status()
-            results = _parse_ddg_html(r.text)
-            if results:
-                return "\n".join(results)
-            errors.append(f"{url}: parsed but no results")
-        except Exception as e:
-            errors.append(f"{url}: {e}")
-    return "ERROR: web_search failed on all endpoints: " + " | ".join(errors)
-
-
 def wikipedia_search(query: str) -> str:
     """Look up a topic on Wikipedia via its official public API (no key,
     not scraping — a sanctioned endpoint, so it doesn't hit bot detection
@@ -187,32 +154,14 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "web_search",
-            "description": (
-                "Search the web to find the real URL of a public dataset or "
-                "statistic (e.g. MOSPI, data.gov.in, PIB, RBI, NFHS reports). "
-                "Use this BEFORE guessing a URL in run_python — never invent "
-                "a dataset URL from memory, always search for it first. This "
-                "can occasionally fail due to bot detection — if it does, try "
-                "wikipedia_search or a differently worded query before giving up."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {"query": {"type": "string", "description": "Search query"}},
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "wikipedia_search",
             "description": (
                 "Look up a topic on Wikipedia via its official API (reliable, "
                 "no key, not scraping). Good for confirming well-known facts, "
                 "statistics, rankings, and figures (e.g. state-wise records, "
-                "demographic data, historical figures) when web_search fails "
-                "or as a cross-check."
+                "demographic data, historical figures) when you don't have a "
+                "direct dataset URL to fetch, or as a cross-check on a computed "
+                "result."
             ),
             "parameters": {
                 "type": "object",
@@ -228,10 +177,12 @@ TOOLS = [
             "description": (
                 "Run Python code on the server and get its printed output. "
                 "pandas, numpy, requests, bs4, openpyxl are installed and the "
-                "network is available (download public datasets with requests, "
-                "e.g. MOSPI / data.gov.in CSV/XLSX/HTML tables — use a URL found "
-                "via web_search or wikipedia_search, never a guessed/placeholder URL). "
-                "Always print() what you need to see — nothing else is returned."
+                "network is available. This is your PRIMARY way to get data: "
+                "construct a direct URL to a known dataset root (see system "
+                "prompt for known domains: data.gov.in, MOSPI, PIB, RBI DBIE, "
+                "NFHS) and fetch it with requests, or download/parse CSV/XLSX/"
+                "HTML tables the question points at directly. Always print() "
+                "what you need to see — nothing else is returned."
             ),
             "parameters": {
                 "type": "object",
@@ -246,9 +197,19 @@ SYSTEM_PROMPT = """You are an expert data-analyst agent answering questions sent
 
 Rules:
 1. Work out the answer to the user's LATEST message. Earlier messages in the chat are context for multi-turn tasks. Even if the latest message is only setup/context ("I will send data next."), you must still reply with a small JSON ack, e.g. {"answer": "ok", "log_url": "LOG_URL"} — never stay silent.
-2. The message may embed data inline, or reference a public dataset (MOSPI, data.gov.in, PIB, RBI, NFHS, etc.). NEVER invent or guess a dataset URL from memory — URLs you hallucinate will 404 or return the wrong page. Instead: call web_search first to find the real page/report/file, THEN use run_python (with requests/pandas/bs4) to fetch and compute from a URL you actually found. Do NOT guess a numeric result you could compute.
-3. If a fetch or parse fails (wrong URL, unexpected format, parser error, etc.), do NOT give up after one attempt. Try again: search with a different, more specific query, try a different URL from the search results, or adjust your parsing approach (e.g. inspect the raw response text/HTML structure with run_python before assuming its format). Make at least 2-3 real attempts with different URLs/approaches before considering the data unreachable.
-4. Only if you have made genuine repeated attempts and still cannot fetch the data, fall back to well-established general knowledge for well-known published statistics (e.g. widely reported MOSPI/SRS/NFHS figures). Even then you must still produce a real, specific value in the correct shape — never a prose apology, never an error message, never "unable to fetch" as the answer content. Give your best-informed concrete answer (e.g. an actual state name, an actual number) even under uncertainty.
+2. The message may embed data inline, or reference a public dataset (MOSPI, data.gov.in, PIB, RBI, NFHS, etc.). You do NOT have a general web-search tool. Instead:
+   a. If the message gives you a URL, fetch it directly with run_python + requests.
+   b. If it names a dataset/portal but no URL, try a direct fetch of that portal's known root first, e.g.:
+      - data.gov.in — https://api.data.gov.in/resource/... or https://data.gov.in/catalogs
+      - MOSPI — https://www.mospi.gov.in (publications, PLFS, NAS, NSS reports)
+      - PIB — https://pib.gov.in (press releases with official figures)
+      - RBI — https://dbie.rbi.org.in (Database on Indian Economy)
+      - NFHS — https://main.mohfw.gov.in or rchiips.org/nfhs
+      Inspect the raw response (print status code, headers, first N chars of text) before assuming its structure.
+   c. Use wikipedia_search to confirm well-known published statistics, rankings, or figures when a direct fetch isn't feasible or as a cross-check.
+   d. Never invent a specific numeric result from memory when you could compute it — always prefer fetching + computing over guessing.
+3. If a fetch or parse fails (wrong URL, unexpected format, parser error, etc.), do NOT give up after one attempt. Try again: a different URL structure, a different known domain, or adjust your parsing approach. Make at least 2-3 real attempts with different URLs/approaches before considering the data unreachable.
+4. Only if you have made genuine repeated attempts and still cannot fetch the data, fall back honestly to well-established general knowledge for well-known published statistics (e.g. widely reported MOSPI/SRS/NFHS figures). Even then you must still produce a real, specific value in the correct shape — never a prose apology, never an error message, never "unable to fetch" as the answer content. Give your best-informed concrete answer (e.g. an actual state name, an actual number) even under uncertainty, and never pretend a knowledge-based answer came from live retrieval.
 5. The message usually spells out the exact JSON shape it wants, e.g. Reply with ONLY {"answer": {"state": "<state>"}, "log_url": "..."}. Match that shape EXACTLY in every case, including fallback/failure cases: same keys, same nesting, correct types (numbers as JSON numbers unless a string is explicitly requested), and round numbers exactly as instructed (if unspecified, give reasonable precision, e.g. 2 decimal places).
 6. When ready, reply with ONLY that JSON object — no prose before or after, no markdown code fences, nothing else in the message. Use the literal placeholder string "LOG_URL" for the log_url value; the harness substitutes the real URL automatically.
 7. If the message does not specify a shape at all, reply {"answer": <your concise answer>, "log_url": "LOG_URL"}.
@@ -344,16 +305,16 @@ def solve(chat_id: int, question: str) -> str:
             messages.append(msg)
             for tc in tool_calls:
                 fn_name = tc["function"]["name"]
-                if fn_name == "web_search":
+                if fn_name == "wikipedia_search":
                     try:
                         args = json.loads(tc["function"]["arguments"])
                     except json.JSONDecodeError:
                         args = {}
                     query = args.get("query", "")
-                    log_event(event="tool_call", chat_id=chat_id, step=step, tool="web_search", query=query)
-                    output = web_search(query)
-                    log_event(event="tool_result", chat_id=chat_id, step=step, tool="web_search", output=output[:4000])
-                else:
+                    log_event(event="tool_call", chat_id=chat_id, step=step, tool="wikipedia_search", query=query)
+                    output = wikipedia_search(query)
+                    log_event(event="tool_result", chat_id=chat_id, step=step, tool="wikipedia_search", output=output[:4000])
+                elif fn_name == "run_python":
                     try:
                         code = json.loads(tc["function"]["arguments"]).get("code", "")
                     except json.JSONDecodeError:
@@ -361,6 +322,9 @@ def solve(chat_id: int, question: str) -> str:
                     log_event(event="tool_call", chat_id=chat_id, step=step, tool="run_python", code=code[:4000])
                     output = run_python(code)
                     log_event(event="tool_result", chat_id=chat_id, step=step, tool="run_python", output=output[:4000])
+                else:
+                    output = f"ERROR: unknown tool '{fn_name}'"
+                    log_event(event="tool_error", chat_id=chat_id, step=step, tool=fn_name, error=output)
                 messages.append({"role": "tool", "tool_call_id": tc["id"], "content": output})
             continue
 
