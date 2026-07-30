@@ -133,6 +133,56 @@ def web_search(query: str) -> str:
     return "ERROR: web_search failed on all endpoints: " + " | ".join(errors)
 
 
+def wikipedia_search(query: str) -> str:
+    """Look up a topic on Wikipedia via its official public API (no key,
+    not scraping — a sanctioned endpoint, so it doesn't hit bot detection
+    the way DuckDuckGo scraping does). Returns page titles + snippets, and
+    the full extract of the top match."""
+    try:
+        r = requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={
+                "action": "query",
+                "list": "search",
+                "srsearch": query,
+                "format": "json",
+                "srlimit": 5,
+            },
+            headers=_SEARCH_HEADERS,
+            timeout=20,
+        )
+        r.raise_for_status()
+        hits = r.json().get("query", {}).get("search", [])
+        if not hits:
+            return "(no Wikipedia results found)"
+        lines = []
+        for h in hits:
+            snippet = re.sub("<[^<]+?>", "", h.get("snippet", ""))
+            lines.append(f"- {h['title']}: {snippet}")
+        # also fetch a fuller extract of the top match
+        top_title = hits[0]["title"]
+        r2 = requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={
+                "action": "query",
+                "prop": "extracts",
+                "explaintext": 1,
+                "titles": top_title,
+                "format": "json",
+            },
+            headers=_SEARCH_HEADERS,
+            timeout=20,
+        )
+        r2.raise_for_status()
+        pages = r2.json().get("query", {}).get("pages", {})
+        extract = next(iter(pages.values()), {}).get("extract", "")
+        if extract:
+            lines.append(f"\nFull extract of '{top_title}':\n{extract[:3000]}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"ERROR: wikipedia_search failed: {e}"
+
+
 TOOLS = [
     {
         "type": "function",
@@ -142,11 +192,31 @@ TOOLS = [
                 "Search the web to find the real URL of a public dataset or "
                 "statistic (e.g. MOSPI, data.gov.in, PIB, RBI, NFHS reports). "
                 "Use this BEFORE guessing a URL in run_python — never invent "
-                "a dataset URL from memory, always search for it first."
+                "a dataset URL from memory, always search for it first. This "
+                "can occasionally fail due to bot detection — if it does, try "
+                "wikipedia_search or a differently worded query before giving up."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {"query": {"type": "string", "description": "Search query"}},
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "wikipedia_search",
+            "description": (
+                "Look up a topic on Wikipedia via its official API (reliable, "
+                "no key, not scraping). Good for confirming well-known facts, "
+                "statistics, rankings, and figures (e.g. state-wise records, "
+                "demographic data, historical figures) when web_search fails "
+                "or as a cross-check."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "Topic or question to look up"}},
                 "required": ["query"],
             },
         },
@@ -160,7 +230,7 @@ TOOLS = [
                 "pandas, numpy, requests, bs4, openpyxl are installed and the "
                 "network is available (download public datasets with requests, "
                 "e.g. MOSPI / data.gov.in CSV/XLSX/HTML tables — use a URL found "
-                "via web_search, never a guessed/placeholder URL). "
+                "via web_search or wikipedia_search, never a guessed/placeholder URL). "
                 "Always print() what you need to see — nothing else is returned."
             ),
             "parameters": {
