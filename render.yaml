@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: tds-p1-2026-telegram-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn bot:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: AIPIPE_TOKEN
+        sync: false
+      - key: MODEL
+        value: gpt-4o
+      - key: MODEL_BASE_URL
+        value: https://aipipe.org/openai/v1
+      - key: BASE_URL
+        sync: false
+      - key: LOG_PATH
+        value: /tmp/run.jsonl
